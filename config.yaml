@@ -1,0 +1,115 @@
+# 과제④ X-ray 영상 기반 완제품 이물질 탐지 — 최종 분석모델 XGD Generalization Assurance Analyzer 설정
+# 모든 고정값은 이 파일에만 둔다. 어떤 값도 X14·회귀 검증·평가 79장 결과를 보고 조정하지 않았다.
+# 판정 규칙의 봉인 출처: X8 배율 규칙(2026-10-05 14:57) · X12 품질 게이트(16:56) · CRC α 0.05 + 2026-10-04 보증 규칙 ·
+# X14 판정 순서(19:41). 전처리·학습 값은 DFL 폴드 모델을 학습할 때의 원 설정(4번 분석 모델/config.yaml) 그대로다.
+# XGD-1.1.0 (2026-10-05): 독립 검토가 찾은 안전 판정 버그만 수정했다(가중치·전처리·배율·품질 신호·임계값 값은 그대로).
+#   장비 운영 등급(enum) 집행, 배율 envelope 집행, CRC/LTT 동점 묶음 처리, 검출 0개 REVIEW, 비정상 입력·호환되지 않는 보정 산출물 FULL.
+#   1.0.0 코드·산출물은 versions/XGD-1.0.0/ 에 보존. 판정 우선순위: FULL 조건(하나라도) > REVIEW 조건(하나라도) > ACCEPT.
+version: XGD-1.1.0
+claim: "Within-provider empirical generalization assurance under a validated operating envelope."
+seed: 17
+device: 0            # GPU 번호. GPU가 없으면 cpu (CPU 결과는 GPU 결과와 비트 단위로 같지 않을 수 있음)
+threads: 6
+
+paths:
+  metadata: data/metadata.json   # 영상별 장비·촬영일·해상도·원본 해시 (개발 356 + 평가 79)
+  artifacts: outputs             # 보정 산출물(outputs/calibration), 검증·예측 결과
+
+preprocess:          # 검사기 색 표시 제거(v3) + 흔적 무력화 학습 영상(v3tr)
+  overlay_gain: 1.2453          # 1 / 0.803: 표시 안쪽을 ×0.80 어둡게 한 반투명 덮개의 복원 이득(중앙값)
+  gain_shrink: 0.5              # 표시마다 추정한 이득을 전체 값 쪽으로 절반 수축
+  fake_mark: {side: 20, thick: 2, interior: 16, darken: 0.80, red_ratio: 0.88}
+  train_marks_per_image: [1, 2] # 학습 영상마다 이물 없는 곳에 넣는 가짜 표시 수
+
+train:               # DFL 폴드 검출기 학습 조리법 (원 protocol train 설정 + dfl_orig 구성의 척도 증강 0.40)
+  model: data/models/yolo26s-dfl.yaml      # YOLO26s + 분포형 박스 회귀(DFL, reg_max 16)
+  init_weights: data/initial/coco_yolo26s.pt
+  scheme: t2                               # data/validation_split.json 의 장비 단위 분할
+  epochs: 40
+  imgsz: 960
+  batch: 4
+  optimizer: AdamW
+  lr0: 0.0002
+  weight_decay: 0.001
+  box: 10.0
+  cls: 0.5
+  mosaic: 0.0
+  scale: 0.4
+  degrees: 3.0
+  translate: 0.03
+  hsv_v: 0.10
+  fliplr: 0.5
+
+detector:
+  family: "DFL (yolo26s-dfl.yaml, reg_max 16) frozen protocol fold models"
+  preprocess: "src.preprocess.clean_v3 (inspection-mark removal); skip with preprocessed=true"
+  predict: {conf: 0.001, iou: 0.6, max_det: 30, rect: false, half: false}
+  e0_radius_px: 4.0                            # 중복 억제(E0): 더 높은 점수 검출 중심 4px 안의 검출 제거
+  decision_threshold: 0.25                     # 검출 보고·실패 판정·CRC 신뢰도에 쓰는 운영 점수
+  default_profile: dfl_src12
+  default_seed: 17
+
+profiles:
+  dfl_src12:
+    role: deployment
+    description: "DFL t2 fold-B models: trained on 1호기 124 + 2호기 132 development images; 3호기 never seen by the detector"
+    training_split: {scheme: t2, held_fold: 1}
+    checkpoints:
+      17: "weights/dfl_src12_s17.pt"
+      29: "weights/dfl_src12_s29.pt"
+      43: "weights/dfl_src12_s43.pt"
+  dfl_src3_2:
+    role: deployment
+    description: "DFL t2 fold-A models: trained on 3호기 100 + 2호기 32 development images; 1호기 never seen, 2호기 partly seen (new dates only)"
+    training_split: {scheme: t2, held_fold: 0}
+    checkpoints:
+      17: "weights/dfl_src3_2_s17.pt"
+      29: "weights/dfl_src3_2_s29.pt"
+      43: "weights/dfl_src3_2_s43.pt"
+  yolo_src12:          # 비교 기준(운영에 쓰지 않음): 일반 YOLO26s(reg_max 1), DFL 과 같은 자료·전처리·조리법·분할·seed
+    role: baseline
+    description: "YOLO26s baseline (reg_max 1), same data / v3tr training images / recipe / t2 fold-B split / seeds as dfl_src12"
+    training_split: {scheme: t2, held_fold: 1}
+    checkpoints:
+      17: "weights/baseline_yolo26s/yolo26s_src12_s17.pt"
+      29: "weights/baseline_yolo26s/yolo26s_src12_s29.pt"
+      43: "weights/baseline_yolo26s/yolo26s_src12_s43.pt"
+  yolo_src3_2:
+    role: baseline
+    description: "YOLO26s baseline (reg_max 1), same data / v3tr training images / recipe / t2 fold-A split / seeds as dfl_src3_2"
+    training_split: {scheme: t2, held_fold: 0}
+    checkpoints:
+      17: "weights/baseline_yolo26s/yolo26s_src3_2_s17.pt"
+      29: "weights/baseline_yolo26s/yolo26s_src3_2_s29.pt"
+      43: "weights/baseline_yolo26s/yolo26s_src3_2_s43.pt"
+
+deployment:
+  routing: "per device, the role=deployment profile whose CRC calibration covers that device (labeled device images not used to train it); default_profile if several"
+
+scale_policy:                                  # X8 (장비 번호 없이 촬영 기하만 사용)
+  canvas: 960
+  tolerance: 0.95
+  rule: "native unless the target letterbox ratio < tolerance x min(training letterbox ratios); then imgsz = 32*round(min_ratio*max(w,h)/32); never downscale, never beyond the training range"
+  meaning: "scale = effective network input magnification imgsz / max(width, height) (letterbox ratio), NOT the physical X-ray geometric magnification or pixel pitch"
+  envelope: "XGD-1.1.0: automatic decision only if tolerance x min <= effective scale <= max / tolerance; forced diagnostic scales (X14 under / over / native) are never the operating path"
+
+quality_gate:                                  # X12 다중 촬영일 정적 품질 envelope (Q2, Q4)
+  signals: [Q2, Q4]
+  z_review: 3.0
+  z_full: 6.0
+  reference: "location = mean of session medians; scale = sqrt((1.4826 MAD of pooled within-session residuals)^2 + SD(session medians)^2)"
+  update_policy: "static; a new normal session enters only after human verification -> offline rebuild -> new reference version"
+
+crc:
+  alpha: 0.05
+  trust: "mean confidence of detections >= decision_threshold (0 if none)"
+  min_calibration: 20                          # 미만: FULL_REINSPECTION (n < 19 이면 α 0.05 CRC 가 어떤 영상도 수용 못 함)
+  stable_calibration: 60                       # X10: 약 60장부터 coverage 안정(p10 >= 0.9)
+  ltt_delta: 0.10
+  risk_definition: "CRC controls the EXPECTED joint risk P(ACCEPT and failure) (denominator = all images) under exchangeability; it is not P(failure | ACCEPT). Failure = any GT missed at 3 px or any FP at score >= 0.25."
+  ties: "XGD-1.1.0: equal trust values form one block; the bound is computed on the set accepted by trust >= lambda"
+
+qualification_rule: "fixed 2026-10-04: QUALIFIED if worst-seed 3px >= .95, FP/image <= .05, CRC0.05 controlled with coverage >= .5; REVIEW if controlled and worst seed >= .90; else UNQUALIFIED"
+grade_enforcement: "XGD-1.1.0: grade is an enum (QUALIFIED / REVIEW / UNQUALIFIED); UNQUALIFIED, unknown or missing -> FULL_REINSPECTION; REVIEW -> no automatic ACCEPT. The grade is empirical and separate from any probability guarantee."
+
+numerics: {cublas_workspace: ":4096:8", tf32: false, cudnn_benchmark: false, deterministic: true}
